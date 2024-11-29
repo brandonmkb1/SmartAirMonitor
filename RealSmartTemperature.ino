@@ -1,4 +1,4 @@
-#include <Wire.h> 
+#include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <DHT.h>
 
@@ -6,15 +6,21 @@
 #define DHTPIN 2           // DHT11 sensor pin
 #define DHTTYPE DHT11      // DHT11 type
 #define MQ135PIN A0        // MQ-135 sensor analog pin
+#define FLAMEPIN A1        // Flame sensor pin
 #define GREEN_LED 8        // Green LED pin
 #define YELLOW_LED 9       // Yellow LED pin
 #define RED_LED 10         // Red LED pin
 #define BUZZER 11          // Buzzer pin
 
-// Thresholds for air quality (adjust these values as needed)
-#define GAS_GOOD 200     // Good air quality threshold
-#define GAS_MEDIUM 400 // Medium air quality threshold
-#define GAS_BAD 600      // Bad/harmful air quality threshold
+// Thresholds for air quality
+#define GAS_GOOD 500       // Good air quality threshold
+#define GAS_MEDIUM 700     // Medium air quality threshold
+#define GAS_BAD 900        // Bad/harmful air quality threshold
+#define FLAME_THRESHOLD 150 // Flame sensor detection threshold (analog value)
+
+// Calibration offsets for DHT11
+float tempOffset = -12.0;  // Adjust temperature (°C)
+float humidOffset = 0.0;   // Adjust humidity (%)
 
 // Initialize DHT sensor
 DHT dht(DHTPIN, DHTTYPE);
@@ -24,139 +30,172 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // Variables for rotating display
 unsigned long previousMillis = 0;    // Store last time screen was updated
-const long interval = 1000;          // Interval for rotating display (1 second)
+const long interval = 2000;          // Interval for rotating display (2 seconds)
 int displayState = 0;                // Track current state (0 = temp/humid, 1 = gas level)
 
 // Variables to hold sensor data
 float temperature;
 float humidity;
 int gasLevel;
+int flameValue;
+
+// Flags for LED and buzzer states
+bool flameActive = false;
+bool gasHarmActive = false;
 
 void setup() {
-  // Start the serial communication
-  Serial.begin(9600);
-
-  // Initialize DHT11 sensor
+  Serial.begin(115200);  // Communication with ESP8266
   dht.begin();
-
-  // Initialize the LCD
   lcd.init();
   lcd.backlight();
   
-  // Set LED and buzzer pins as output
   pinMode(GREEN_LED, OUTPUT);
   pinMode(YELLOW_LED, OUTPUT);
   pinMode(RED_LED, OUTPUT);
   pinMode(BUZZER, OUTPUT);
+  pinMode(FLAMEPIN, INPUT);
 
-  // Ensure all LEDs and buzzer are off at start
   digitalWrite(GREEN_LED, LOW);
   digitalWrite(YELLOW_LED, LOW);
   digitalWrite(RED_LED, LOW);
-  noTone(BUZZER);  // Ensure buzzer is off at start
+  noTone(BUZZER);
 
-  // Initial message on the serial monitor
   Serial.println("System initialized. Starting sensor readings...");
 }
 
 void loop() {
-  // Read the DHT11 sensor
-  temperature = dht.readTemperature();
-  humidity = dht.readHumidity();
-
-  // Read the MQ-135 sensor value
+  flameValue = analogRead(FLAMEPIN);
   gasLevel = analogRead(MQ135PIN);
 
-  // Update the display every 'interval' milliseconds
+  // Handle Flame Sensor
+  if (flameValue < FLAME_THRESHOLD) {
+    flameActive = true;
+  } else {
+    flameActive = false;
+  }
+
+  // Handle Gas Sensor
+  if (gasLevel >= GAS_BAD) {
+    gasHarmActive = true;
+  } else {
+    gasHarmActive = false;
+  }
+
+  // Priority Control
+  if (flameActive) {
+    activateRedAlert();
+    return;  // Exit early, as flame detection takes priority
+  } 
+  else if (gasHarmActive) {
+    activateRedAlert();
+  } 
+  else {
+    deactivateRedAlert();
+    handleGasIndicators();
+  }
+
+  // Update Display and Serial Output
   unsigned long currentMillis = millis();
   if (currentMillis - previousMillis >= interval) {
-    previousMillis = currentMillis;  // Save the last time the display was updated
-    
-    // Rotate between different states (0, 1)
+    previousMillis = currentMillis;
+    float rawTemp = dht.readTemperature();
+    float rawHumid = dht.readHumidity();
+    temperature = rawTemp + tempOffset;
+    humidity = rawHumid + humidOffset;
+
     if (displayState == 0) {
       displayTemperatureHumidity();
-      displayState = 1;  // Next, show gas level
-    } else if (displayState == 1) {
+      displayState = 1;
+    } else {
       displayGasLevel();
-      displayState = 0;  // Loop back to temperature/humidity
+      displayState = 0;
     }
+
+    // Print to Serial for debugging
+    Serial.print("Temperature: ");
+    Serial.print(temperature);
+    Serial.print(", Humidity: ");
+    Serial.print(humidity);
+    Serial.print(", Gas Level: ");
+    Serial.println(gasLevel);
+
+    // Send data to ESP8266
+    sendDataToNodeMCU();
+  }
+}
+
+void sendDataToNodeMCU() {
+  // Use dtostrf for float to string conversion
+  char tempStr[6], humidStr[6];
+  dtostrf(temperature, 4, 2, tempStr);
+  dtostrf(humidity, 4, 2, humidStr);
+
+  // Construct a clean, comma-separated string
+  String dataString = String(tempStr) + "," + 
+                      String(humidStr) + "," + 
+                      String(gasLevel) + "," + 
+                      String(flameValue);
+  
+  Serial.println(dataString);
+}
+
+
+
+void activateRedAlert() {
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(YELLOW_LED, LOW);
+  digitalWrite(RED_LED, HIGH);
+  tone(BUZZER, 1000);  // Emit 1kHz tone consistently
+}
+
+void deactivateRedAlert() {
+  digitalWrite(RED_LED, LOW);
+  noTone(BUZZER);
+}
+
+void handleGasIndicators() {
+  if (gasLevel >= GAS_MEDIUM) {
+    // Medium or bad air quality
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(YELLOW_LED, HIGH);
+  } else if (gasLevel < GAS_MEDIUM && gasLevel >= GAS_GOOD) {
+    // Good air quality
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(YELLOW_LED, HIGH);
+  } else {
+    // Very good air quality (below GAS_GOOD)
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(YELLOW_LED, LOW);
   }
 }
 
 void displayTemperatureHumidity() {
-  // Clear the LCD and display temperature/humidity
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("Temp: ");
   lcd.print(temperature);
   lcd.print("C");
-
   lcd.setCursor(0, 1);
   lcd.print("Humid: ");
   lcd.print(humidity);
   lcd.print("%");
-
-  // Print to Serial Monitor
-  Serial.print("Temperature: ");
-  Serial.print(temperature);
-  Serial.print(" C, Humidity: ");
-  Serial.print(humidity);
-  Serial.println(" %");
 }
 
 void displayGasLevel() {
-  // Clear the LCD and display gas level
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("Gas Level: ");
   lcd.print(gasLevel);
-
-  // Determine air quality and update LEDs/buzzer
   lcd.setCursor(0, 1);
+
   if (gasLevel < GAS_GOOD) {
     lcd.print("Air: Good ");
-    digitalWrite(GREEN_LED, HIGH);
-    digitalWrite(YELLOW_LED, LOW);
-    digitalWrite(RED_LED, LOW);
-    noTone(BUZZER);  // Ensure buzzer is off
-
-    // Print to Serial Monitor
-    Serial.println("Air Quality: Good");
-  } 
-  else if (gasLevel >= GAS_GOOD && gasLevel < GAS_MEDIUM) {
+  } else if (gasLevel >= GAS_GOOD && gasLevel < GAS_MEDIUM) {
     lcd.print("Air: Med  ");
-    digitalWrite(GREEN_LED, LOW);
-    digitalWrite(YELLOW_LED, HIGH);
-    digitalWrite(RED_LED, LOW);
-    noTone(BUZZER);  // Ensure buzzer is off
-
-    // Print to Serial Monitor
-    Serial.println("Air Quality: Medium");
-  } 
-  else if (gasLevel >= GAS_MEDIUM && gasLevel < GAS_BAD) {
+  } else if (gasLevel >= GAS_MEDIUM && gasLevel < GAS_BAD) {
     lcd.print("Air: Bad  ");
-    digitalWrite(GREEN_LED, LOW);
-    digitalWrite(YELLOW_LED, LOW);
-    digitalWrite(RED_LED, HIGH);
-    noTone(BUZZER);  // Ensure buzzer is off for bad air quality
-
-    // Print to Serial Monitor
-    Serial.println("Air Quality: Bad");
-  } 
-  else {
+  } else {
     lcd.print("Air: Harm ");
-    digitalWrite(GREEN_LED, LOW);
-    digitalWrite(YELLOW_LED, LOW);
-    digitalWrite(RED_LED, HIGH);
-    
-    // Activate buzzer for harmful air quality
-    tone(BUZZER, 1000);  // Emit a 1kHz tone for passive buzzers
-    
-    // Print to Serial Monitor
-    Serial.println("Air Quality: Harmful - Buzzer activated!");
   }
-
-  // Print gas level to Serial Monitor
-  Serial.print("Gas Level: ");
-  Serial.println(gasLevel);
 }
+
